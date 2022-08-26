@@ -13,6 +13,7 @@
        OBJECT-COMPUTER. IBM-FLEX-ES.
       *
        DATA DIVISION.
+      Introduce error.
        WORKING-STORAGE SECTION.
       *
        01  W-FLAGS.
