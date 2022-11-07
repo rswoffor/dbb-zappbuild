@@ -77,7 +77,11 @@ sortedList.each { buildFile ->
 def createLinkEditCommand(String buildFile, LogicalFile logicalFile, String member, File logFile) {
 	String parms = props.getFileProperty('linkEdit_parms', buildFile)
 	String linker = props.getFileProperty('linkedit_linkEditor', buildFile)
-
+	String memberAltName = props.getFileProperty('linkedit_memberAltName', buildFile)
+	println "Member alternative name: $memberAltName"
+	if (!memberAltName)
+	   memberAltName = member
+	
 	// obtain githash for buildfile
 	String linkedit_storeSSI = props.getFileProperty('linkedit_storeSSI', buildFile) 
 	if (linkedit_storeSSI && linkedit_storeSSI.toBoolean() && (props.mergeBuild || props.impactBuild || props.fullBuild)) {
@@ -91,7 +95,7 @@ def createLinkEditCommand(String buildFile, LogicalFile logicalFile, String memb
 	// deployType requires a file level overwrite to define isCICS and isDLI, while the linkcard does not carry isCICS, isDLI attributes
 	String deployType = buildUtils.getDeployType("linkedit", buildFile, logicalFile)
 	linkedit.dd(new DDStatement().name("SYSLIN").dsn("${props.linkedit_srcPDS}($member)").options("shr").report(true))
-	linkedit.dd(new DDStatement().name("SYSLMOD").dsn("${props.linkedit_loadPDS}($member)").options('shr').output(true).deployType(deployType))
+	linkedit.dd(new DDStatement().name("SYSLMOD").dsn("${props.linkedit_loadPDS}($memberAltName)").options('shr').output(true).deployType(deployType))
 	linkedit.dd(new DDStatement().name("SYSPRINT").options(props.linkedit_tempOptions))
 	linkedit.dd(new DDStatement().name("SYSUT1").options(props.linkedit_tempOptions))
 
