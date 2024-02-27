@@ -1,5 +1,5 @@
 @groovy.transform.BaseScript com.ibm.dbb.groovy.ScriptLoader baseScript
-import com.ibm.dbb.repository.*
+import com.ibm.dbb.metadata.*
 import com.ibm.dbb.dependency.*
 import com.ibm.dbb.build.*
 import groovy.transform.*
@@ -13,14 +13,8 @@ import com.ibm.dbb.build.report.records.*
 @Field def buildUtils= loadScript(new File("${props.zAppBuildDir}/utilities/BuildUtilities.groovy"))
 @Field def impactUtils= loadScript(new File("${props.zAppBuildDir}/utilities/ImpactUtilities.groovy"))
 @Field def bindUtils= loadScript(new File("${props.zAppBuildDir}/utilities/BindUtilities.groovy"))
-@Field RepositoryClient repositoryClient
-
-@Field def resolverUtils
-// Conditionally load the ResolverUtilities.groovy which require at least DBB 1.1.2
-if (props.useSearchConfiguration && props.useSearchConfiguration.toBoolean() && buildUtils.assertDbbBuildToolkitVersion(props.dbbToolkitVersion, "1.1.2")) {
-	resolverUtils = loadScript(new File("${props.zAppBuildDir}/utilities/ResolverUtilities.groovy"))}
 	
-println("** Building files mapped to ${this.class.getName()}.groovy script")
+println("** Building ${argMap.buildList.size()} ${argMap.buildList.size() == 1 ? 'file' : 'files'} mapped to ${this.class.getName()}.groovy script")
 
 // verify required build properties
 buildUtils.assertBuildProperties(props.cobol_requiredBuildProperties)
@@ -30,7 +24,8 @@ def langQualifier = "cobol"
 buildUtils.createLanguageDatasets(langQualifier)
 
 // sort the build list based on build file rank if provided
-List<String> sortedList = buildUtils.sortBuildList(argMap.buildList, 'cobol_fileBuildRank')
+List<String> sortedList = buildUtils.sortBuildList(argMap.buildList.sort(), 'cobol_fileBuildRank')
+int currentBuildFileNumber = 1
 
 if (buildListContainsTests(sortedList)) {
 	langQualifier = "cobol_test"
@@ -39,20 +34,14 @@ if (buildListContainsTests(sortedList)) {
 
 // iterate through build list
 sortedList.each { buildFile ->
-	println "*** Building file $buildFile"
+	println "*** (${currentBuildFileNumber++}/${sortedList.size()}) Building file $buildFile"
 
 	// Check if this a testcase
-	isZUnitTestCase = (props.getFileProperty('cobol_testcase', buildFile).equals('true')) ? true : false
+	isZUnitTestCase = buildUtils.isGeneratedzUnitTestCaseProgram(buildFile)
 
-	// configure appropriate dependency resolver
-	def dependencyResolver
-	if (props.useSearchConfiguration && props.useSearchConfiguration.toBoolean() && props.cobol_dependencySearch && buildUtils.assertDbbBuildToolkitVersion(props.dbbToolkitVersion, "1.1.2")) { // use new SearchPathDependencyResolver
-		String dependencySearch = props.getFileProperty('cobol_dependencySearch', buildFile)
-		dependencyResolver = resolverUtils.createSearchPathDependencyResolver(dependencySearch)
-	} else { // use deprecated DependencyResolver
-		String rules = props.getFileProperty('cobol_resolutionRules', buildFile)
-		dependencyResolver = buildUtils.createDependencyResolver(buildFile, rules)
-	}
+	// configure dependency resolution and create logical file	
+	String dependencySearch = props.getFileProperty('cobol_dependencySearch', buildFile)
+	SearchPathDependencyResolver dependencyResolver = new SearchPathDependencyResolver(dependencySearch)
 	
 	// copy build file and dependency files to data sets
 	if(isZUnitTestCase){
@@ -61,22 +50,23 @@ sortedList.each { buildFile ->
 		buildUtils.copySourceFiles(buildFile, props.cobol_srcPDS, 'cobol_dependenciesDatasetMapping', props.cobol_dependenciesAlternativeLibraryNameMapping, dependencyResolver)
 	}
 
-	// get logical file
-	LogicalFile logicalFile
-	if (dependencyResolver instanceof SearchPathDependencyResolver) {
-		logicalFile = resolverUtils.createLogicalFile(dependencyResolver, buildFile)
-	}
-	else {
-		logicalFile = dependencyResolver.getLogicalFile()
-	}
+	// Get logical file
+	LogicalFile logicalFile = buildUtils.createLogicalFile(dependencyResolver, buildFile)
 
+	// print logicalFile details and overrides
+	if (props.verbose) buildUtils.printLogicalFileAttributes(logicalFile)
+	
 	// create mvs commands
 	String member = CopyToPDS.createMemberName(buildFile)
+	String needsLinking = props.getFileProperty('cobol_linkEdit', buildFile)
+	
 	File logFile = new File( props.userBuild ? "${props.buildOutDir}/${member}.log" : "${props.buildOutDir}/${member}.cobol.log")
 	if (logFile.exists())
 		logFile.delete()
+	
 	MVSExec compile = createCompileCommand(buildFile, logicalFile, member, logFile)
-	MVSExec linkEdit = createLinkEditCommand(buildFile, logicalFile, member, logFile)
+	MVSExec linkEdit
+	if (needsLinking.toBoolean()) linkEdit = createLinkEditCommand(buildFile, logicalFile, member, logFile)
 
 	// execute mvs commands in a mvs job
 	MVSJob job = new MVSJob()
@@ -93,7 +83,7 @@ sortedList.each { buildFile ->
 		String errorMsg = "*! The compile return code ($rc) for $buildFile exceeded the maximum return code allowed ($maxRC)"
 		println(errorMsg)
 		props.error = "true"
-		buildUtils.updateBuildResult(errorMsg:errorMsg,logs:["${member}.log":logFile],client:getRepositoryClient())
+		buildUtils.updateBuildResult(errorMsg:errorMsg,logs:["${member}.log":logFile])
 	}
 	else { // if this program needs to be link edited . . .
 		
@@ -104,7 +94,6 @@ sortedList.each { buildFile ->
 			BuildReportFactory.getBuildReport().addRecord(db2BindInfoRecord)
 		}
 		
-		String needsLinking = props.getFileProperty('cobol_linkEdit', buildFile)
 		if (needsLinking.toBoolean()) {
 			rc = linkEdit.execute()
 			maxRC = props.getFileProperty('cobol_linkEditMaxRC', buildFile).toInteger()
@@ -114,14 +103,14 @@ sortedList.each { buildFile ->
 				String errorMsg = "*! The link edit return code ($rc) for $buildFile exceeded the maximum return code allowed ($maxRC)"
 				println(errorMsg)
 				props.error = "true"
-				buildUtils.updateBuildResult(errorMsg:errorMsg,logs:["${member}.log":logFile],client:getRepositoryClient())
+				buildUtils.updateBuildResult(errorMsg:errorMsg,logs:["${member}.log":logFile])
 			}
 			else {
 				if(!props.userBuild && !isZUnitTestCase){
 					// only scan the load module if load module scanning turned on for file
 					String scanLoadModule = props.getFileProperty('cobol_scanLoadModule', buildFile)
-					if (scanLoadModule && scanLoadModule.toBoolean() && getRepositoryClient())
-						impactUtils.saveStaticLinkDependencies(buildFile, props.linkedit_loadPDS, logicalFile, repositoryClient)
+					if (scanLoadModule && scanLoadModule.toBoolean())
+						impactUtils.saveStaticLinkDependencies(buildFile, props.cobol_loadPDS, logicalFile)
 				}
 			}
 		}
@@ -140,7 +129,7 @@ sortedList.each { buildFile ->
 			String errorMsg = "*! The bind package return code ($bindRc) for $buildFile exceeded the maximum return code allowed ($props.bind_maxRC)"
 			println(errorMsg)
 			props.error = "true"
-			buildUtils.updateBuildResult(errorMsg:errorMsg,logs:["${member}_bind.log":bindLogFile],client:getRepositoryClient())
+			buildUtils.updateBuildResult(errorMsg:errorMsg,logs:["${member}_bind.log":bindLogFile])
 		}
 	}
 
@@ -182,7 +171,7 @@ def createCobolParms(String buildFile, LogicalFile logicalFile) {
 	if (parms.startsWith(','))
 		parms = parms.drop(1)
 
-	if (props.verbose) println "Cobol compiler parms for $buildFile = $parms"
+	if (props.verbose) println "*** Cobol compiler parms for $buildFile = $parms"
 	return parms
 }
 
@@ -208,22 +197,12 @@ def createCompileCommand(String buildFile, LogicalFile logicalFile, String membe
 	
 	compile.dd(new DDStatement().name("SYSPRINT").options(props.cobol_printTempOptions))
 	compile.dd(new DDStatement().name("SYSMDECK").options(props.cobol_tempOptions))
-	(1..17).toList().each { num ->
+	(1..15).toList().each { num ->
 		compile.dd(new DDStatement().name("SYSUT$num").options(props.cobol_tempOptions))
 	}
 
-	// Write SYSLIN to temporary dataset if performing link edit or to physical dataset
-	String doLinkEdit = props.getFileProperty('cobol_linkEdit', buildFile)
-	String linkEditStream = props.getFileProperty('cobol_linkEditStream', buildFile)
-	String linkDebugExit = props.getFileProperty('cobol_linkDebugExit', buildFile)
-
-	if (props.debug && linkDebugExit && doLinkEdit.toBoolean()){
-		compile.dd(new DDStatement().name("SYSLIN").dsn("${props.cobol_objPDS}($member)").options('shr').output(true))
-	} else if (doLinkEdit && doLinkEdit.toBoolean() && ( !linkEditStream || linkEditStream.isEmpty())) {
-		compile.dd(new DDStatement().name("SYSLIN").dsn("&&TEMPOBJ").options(props.cobol_tempOptions).pass(true))
-	} else {
-		compile.dd(new DDStatement().name("SYSLIN").dsn("${props.cobol_objPDS}($member)").options('shr').output(true))
-	}
+	// define object dataset allocation
+	compile.dd(new DDStatement().name("SYSLIN").dsn("${props.cobol_objPDS}($member)").options('shr').output(true))
 
 	// add a syslib to the compile command with optional bms output copybook and CICS concatenation
 	compile.dd(new DDStatement().name("SYSLIB").dsn(props.cobol_cpyPDS).options("shr"))
@@ -248,10 +227,12 @@ def createCompileCommand(String buildFile, LogicalFile logicalFile, String membe
 		for (String syslibDataset : syslibDatasets )
 		compile.dd(new DDStatement().dsn(syslibDataset).options("shr"))
 	}
+	
+	// add subsystem libraries
 	if (buildUtils.isCICS(logicalFile))
 		compile.dd(new DDStatement().dsn(props.SDFHCOB).options("shr"))
-	String isMQ = props.getFileProperty('cobol_isMQ', buildFile)
-	if (isMQ && isMQ.toBoolean())
+
+	if (buildUtils.isMQ(logicalFile))
 		compile.dd(new DDStatement().dsn(props.SCSQCOBC).options("shr"))
 		
 	// add additional zunit libraries
@@ -270,7 +251,7 @@ def createCompileCommand(String buildFile, LogicalFile logicalFile, String membe
 				String errorMsg = "*! Cobol.groovy. The dataset definition $datasetDefinition could not be resolved from the DBB Build properties."
 				println(errorMsg)
 				props.error = "true"
-				buildUtils.updateBuildResult(errorMsg:errorMsg,client:getRepositoryClient())
+				buildUtils.updateBuildResult(errorMsg:errorMsg)
 			}
 		}
 	}
@@ -280,8 +261,10 @@ def createCompileCommand(String buildFile, LogicalFile logicalFile, String membe
 	compile.dd(new DDStatement().name("TASKLIB").dsn(props."SIGYCOMP_$compilerVer").options("shr"))
 	if (buildUtils.isCICS(logicalFile))
 		compile.dd(new DDStatement().dsn(props.SDFHLOAD).options("shr"))
-	if (buildUtils.isSQL(logicalFile))
+	if (buildUtils.isSQL(logicalFile)) {
+		if (props.SDSNEXIT) compile.dd(new DDStatement().dsn(props.SDSNEXIT).options("shr"))
 		compile.dd(new DDStatement().dsn(props.SDSNLOAD).options("shr"))
+	}
 	
 	if (props.SFELLOAD)
 		compile.dd(new DDStatement().dsn(props.SFELLOAD).options("shr"))
@@ -320,34 +303,52 @@ def createLinkEditCommand(String buildFile, LogicalFile logicalFile, String memb
 		if (ssi != null) parms = parms + ",SSI=$ssi"
 	}
 	
+	if (props.verbose) println "*** Link-Edit parms for $buildFile = $parms"
+	
 	// define the MVSExec command to link edit the program
 	MVSExec linkedit = new MVSExec().file(buildFile).pgm(linker).parm(parms)
 
-	// Create a physical link card
-	if ( (linkEditStream) || (props.debug && linkDebugExit!= null)) {
-		def langQualifier = "linkedit"
-		buildUtils.createLanguageDatasets(langQualifier)
-		def lnkFile = new File("${props.buildOutDir}/linkCard.lnk")
-		if (lnkFile.exists())
-			lnkFile.delete()
-
-		if 	(linkEditStream)
-			lnkFile << "  " + linkEditStream.replace("\\n","\n").replace('@{member}',member)
-		else
-			lnkFile << "  " + linkDebugExit.replace("\\n","\n").replace('@{member}',member)
-
-		if (props.verbose)
-			println("Copying ${props.buildOutDir}/linkCard.lnk to ${props.linkedit_srcPDS}($member)")
-		new CopyToPDS().file(lnkFile).dataset(props.linkedit_srcPDS).member(member).execute()
-		// Alloc SYSLIN
-		linkedit.dd(new DDStatement().name("SYSLIN").dsn("${props.linkedit_srcPDS}($member)").options("shr"))
-		// add the obj DD
-		linkedit.dd(new DDStatement().name("OBJECT").dsn("${props.cobol_objPDS}($member)").options('shr'))
-
-	} else { // no debug && no link card
-		// Use &&TEMP from Compile
+	// Assemble linkEditInstream to define SYSIN as instreamData
+	String sysin_linkEditInstream = ''
+	
+	// appending configured linkEdit stream if specified
+	if (linkEditStream) {
+		sysin_linkEditInstream += "  " + linkEditStream.replace("\\n","\n").replace('@{member}',member)
+	}
+	
+	// appending IDENTIFY statement to link phase for traceability of load modules
+	// this adds an IDRU record, which can be retrieved with amblist
+	def identifyLoad = props.getFileProperty('cobol_identifyLoad', buildFile)
+	
+	if (identifyLoad && identifyLoad.toBoolean()) {
+		String identifyStatement = buildUtils.generateIdentifyStatement(buildFile, props.cobol_loadOptions)
+		if (identifyStatement != null ) {
+			sysin_linkEditInstream += identifyStatement
+		}
+	}
+	
+	// appending mq stub according to file flags
+	if(buildUtils.isMQ(logicalFile)) {
+		// include mq stub program
+		// https://www.ibm.com/docs/en/ibm-mq/9.3?topic=files-mq-zos-stub-programs
+		sysin_linkEditInstream += buildUtils.getMqStubInstruction(logicalFile)
 	}
 
+	// appending debug exit to link instructions
+	if (props.debug && linkDebugExit!= null) {
+		sysin_linkEditInstream += "   " + linkDebugExit.replace("\\n","\n").replace('@{member}',member)
+	}
+
+	// Define SYSIN dd as instream data
+	if (sysin_linkEditInstream) {
+		if (props.verbose) println("*** Generated linkcard input stream: \n $sysin_linkEditInstream")
+		linkedit.dd(new DDStatement().name("SYSIN").instreamData(sysin_linkEditInstream))
+	}
+
+	// add SYSLIN along the reference to SYSIN if configured through sysin_linkEditInstream
+	linkedit.dd(new DDStatement().name("SYSLIN").dsn("${props.cobol_objPDS}($member)").options('shr'))
+	if (sysin_linkEditInstream) linkedit.dd(new DDStatement().ddref("SYSIN"))
+			
 	// add DD statements to the linkedit command
 	String deployType = buildUtils.getDeployType("cobol", buildFile, logicalFile)
 	if(isZUnitTestCase){
@@ -383,25 +384,19 @@ def createLinkEditCommand(String buildFile, LogicalFile logicalFile, String memb
 	if (buildUtils.isCICS(logicalFile))
 		linkedit.dd(new DDStatement().dsn(props.SDFHLOAD).options("shr"))
 	
+	if (buildUtils.isIMS(logicalFile))
+		linkedit.dd(new DDStatement().dsn(props.SDFSRESL).options("shr"))
+			
 	if (buildUtils.isSQL(logicalFile))
 		linkedit.dd(new DDStatement().dsn(props.SDSNLOAD).options("shr"))
 
-	String isMQ = props.getFileProperty('cobol_isMQ', buildFile)
-	if (isMQ && isMQ.toBoolean())
+	if (buildUtils.isMQ(logicalFile))
 		linkedit.dd(new DDStatement().dsn(props.SCSQLOAD).options("shr"))
 
 	// add a copy command to the linkedit command to append the SYSPRINT from the temporary dataset to the HFS log file
 	linkedit.copy(new CopyToHFS().ddName("SYSPRINT").file(logFile).hfsEncoding(props.logEncoding).append(true))
 
 	return linkedit
-}
-
-
-def getRepositoryClient() {
-	if (!repositoryClient && props."dbb.RepositoryClient.url")
-		repositoryClient = new RepositoryClient().forceSSLTrusted(true)
-
-	return repositoryClient
 }
 
 boolean buildListContainsTests(List<String> buildList) {
